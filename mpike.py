@@ -20,11 +20,9 @@ class lpm:
         self.A = []
     
     def to_str(self):
-        V = set()
-        
         # Objective
         S = ['min. ' if self.to_min else 'max. ', str(self.obj_fn), '\n']
-        V.update(self.obj_fn.VC)
+        V = set(self.obj_fn.VC)
         
         # Constraints
         if self.A:
@@ -77,6 +75,87 @@ class lpm:
             self.A.extend(A)
         else:
             self.A.append(A)
+    
+    def solve(self, solver='glpk'):
+        # Collect variables and do numbering.
+        V = set(self.obj_fn.VC)
+        for a in self.A:
+            V.update(a.VC)
+        V = {vid: i for i, vid in enumerate(V)}
+        
+        n = len(V)
+        
+        c = [0] * n
+        for vid, coeff in self.obj_fn.VC.items():
+            c[vid] = coeff
+        
+        A_ub, b_ub, A_eq, b_eq = [], [], [], []
+        for a in self.A:
+            Ai = [0] * n
+            for vid, coeff in a.VC.items():
+                Ai[vid] = coeff
+            
+            if a.le:
+                A_ub.append(Ai)
+                b_ub.append(a.rhs)
+            else:
+                A_eq.append(Ai)
+                b_eq.append(a.rhs)
+        
+        if solver == 'glpk':
+            R = solve_glpk(V, c, A_ub, b_ub, A_eq, b_eq)
+        elif solver == 'scipy':
+            R = solve_scipy(V, c, A_ub, b_ub, A_eq, b_eq)
+        else:
+            assert False
+        
+        return R
+
+
+def solve_glpk(V, c, A_ub, b_ub, A_eq, b_eq):
+    """
+    A_ub should not be empty.
+    """
+    from cvxopt import glpk, matrix, solvers  # @UnresolvedImport
+    
+    # TODO This does not seem to work. C.f. cvxopt/src/C/glpk.c:220.
+    glpk.options['msg_lev'] = 'GLP_MSG_OFF'
+    
+    n, VALL = len(c), variable._ALL
+    for vid, i in V.items():
+        v = VALL[vid]
+        if v.lb > -inf:
+            Ai = [0] * n; Ai[i] = -1
+            A_ub.append(Ai)
+            b_ub.append(-v.lb)
+        if v.ub < inf:
+            Ai = [0] * n; Ai[i] = 1
+            A_ub.append(Ai)
+            b_ub.append(v.ub)
+    
+    Ab = (matrix(A_eq, tc='d').T, matrix(b_eq, tc='d')) if A_eq else (None, None)
+    R = solvers.lp(matrix(c, tc='d'), matrix(A_ub, tc='d').T, matrix(b_ub, tc='d'),
+                   *Ab, solver='glpk')
+    
+    return R
+
+
+def solve_scipy(V, c, A_ub, b_ub, A_eq, b_eq):
+    from scipy.optimize._linprog import linprog
+    
+    bounds, VALL = [None] * len(V), variable._ALL
+    for vid, i in V.items():
+        v = VALL[vid]
+        bounds[i] = (v.lb, v.ub)
+    
+    if not A_ub:
+        A_ub, b_ub = None, None
+    if not A_eq:
+        A_eq, b_eq = None, None
+    
+    R = linprog(c, A_ub, b_ub, A_eq, b_eq, bounds)
+    
+    return R
 
 
 class variable:
@@ -258,7 +337,7 @@ class expression:
 class assertion:
     """
     VC
-    le: whether less than or equal relation
+    le: whether less than (True) or equal relation (False)
     rhs: right-hand side
     """
     
@@ -273,22 +352,22 @@ class assertion:
 
 
 def _format(VC, ct):
-    _V, S, first = variable._ALL, [], True
+    VALL, S, first = variable._ALL, [], True
     
     for vid, c in VC.items():
         if first:
             first = False
             if c == -1:
-                S.append('-' + _V[vid].name)
+                S.append('-' + VALL[vid].name)
             else:
                 if c != 1:
                     S.append(str(c))
-                S.append(_V[vid].name)
+                S.append(VALL[vid].name)
         else:
             S.append('-' if c < 0 else '+')
             if c != 1:
                 S.append(str(-c if c < 0 else c))
-            S.append(_V[vid].name)
+            S.append(VALL[vid].name)
     
     if first:
         S.append(str(ct))
@@ -310,10 +389,14 @@ def test():
     
     m.st([
         -3 * x + y <= 6,
-        x + 2 * y <= 4,
+        x + 2 * y <= 4
     ])
     
     print(m.to_str())
+    
+    R = m.solve()
+    #R = m.solve('scipy')
+    print(R)
 
 
 if __name__ == '__main__':
