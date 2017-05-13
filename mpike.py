@@ -3,7 +3,11 @@ from numbers import Real
 
 
 """
-TODO Efficiency!
+Solvers:
+  scipy: scipy.optimize.linprog (Python implementation)
+  glpk: cvxopt.solvers.lp with glpk (C implementation)
+
+TODO Efficiency!!!
 """
 
 
@@ -12,16 +16,18 @@ EPSILON = 1e-7
 
 class lpm:
     """
+    obj_fn
+    sense: 1, if minimizing; -1, if maximizing
     A: list of assertions
     """
     
     def __init__(self):
-        self.obj_fn, self.to_min = None, True
+        self.obj_fn, self.sense = None, True
         self.A = []
     
     def to_str(self):
         # Objective
-        S = ['min. ' if self.to_min else 'max. ', str(self.obj_fn), '\n']
+        S = ['min. ' if self.sense < 0 else 'max. ', str(self.obj_fn), '\n']
         V = set(self.obj_fn.VC)
         
         # Constraints
@@ -65,10 +71,12 @@ class lpm:
         return variable(N[0]) if len(N) == 1 else [variable(n) for n in N]
     
     def min(self, e):
-        self.obj_fn, self.to_min = e, True
+        self.obj_fn = expression(0, [e, 1]) if isinstance(e, variable) else e
+        self.sense = 1
     
     def max(self, e):
-        self.obj_fn, self.to_min = e, False
+        self.obj_fn = expression(0, [e, 1]) if isinstance(e, variable) else e
+        self.sense = -1
     
     def st(self, A):
         if isinstance(A, list) or isinstance(A, tuple):
@@ -77,6 +85,10 @@ class lpm:
             self.A.append(A)
     
     def solve(self, solver='glpk'):
+        """
+        RETURN
+            None: infeasible
+        """
         # Collect variables and do numbering.
         V = set(self.obj_fn.VC)
         for a in self.A:
@@ -87,13 +99,13 @@ class lpm:
         
         c = [0] * n
         for vid, coeff in self.obj_fn.VC.items():
-            c[vid] = coeff
+            c[V[vid]] = coeff * self.sense
         
         A_ub, b_ub, A_eq, b_eq = [], [], [], []
         for a in self.A:
             Ai = [0] * n
             for vid, coeff in a.VC.items():
-                Ai[vid] = coeff
+                Ai[V[vid]] = coeff
             
             if a.le:
                 A_ub.append(Ai)
@@ -103,13 +115,13 @@ class lpm:
                 b_eq.append(a.rhs)
         
         if solver == 'glpk':
-            R = solve_glpk(V, c, A_ub, b_ub, A_eq, b_eq)
+            z0 = solve_glpk(V, c, A_ub, b_ub, A_eq, b_eq)
         elif solver == 'scipy':
-            R = solve_scipy(V, c, A_ub, b_ub, A_eq, b_eq)
+            z0 = solve_scipy(V, c, A_ub, b_ub, A_eq, b_eq)
         else:
             assert False
         
-        return R
+        return z0 * self.sense
 
 
 def solve_glpk(V, c, A_ub, b_ub, A_eq, b_eq):
@@ -124,6 +136,8 @@ def solve_glpk(V, c, A_ub, b_ub, A_eq, b_eq):
     n, VALL = len(c), variable._ALL
     for vid, i in V.items():
         v = VALL[vid]
+        v.sv = None
+        
         if v.lb > -inf:
             Ai = [0] * n; Ai[i] = -1
             A_ub.append(Ai)
@@ -137,15 +151,28 @@ def solve_glpk(V, c, A_ub, b_ub, A_eq, b_eq):
     R = solvers.lp(matrix(c, tc='d'), matrix(A_ub, tc='d').T, matrix(b_ub, tc='d'),
                    *Ab, solver='glpk')
     
-    return R
+    if R['status'] == 'optimal':
+        sol = R['x']
+        for vid, i in V.items():
+            VALL[vid].sv = sol[i]
+        return R['primal objective']
+    
+    elif R['status'] == 'dual infeasible':  # primal unbounded
+        return -inf
+    
+    assert R['status'] == 'primal infeasible'
+    return None
 
 
 def solve_scipy(V, c, A_ub, b_ub, A_eq, b_eq):
     from scipy.optimize._linprog import linprog
     
     bounds, VALL = [None] * len(V), variable._ALL
+    
     for vid, i in V.items():
         v = VALL[vid]
+        v.sv = None
+        
         bounds[i] = (v.lb, v.ub)
     
     if not A_ub:
@@ -155,11 +182,28 @@ def solve_scipy(V, c, A_ub, b_ub, A_eq, b_eq):
     
     R = linprog(c, A_ub, b_ub, A_eq, b_eq, bounds)
     
-    return R
+    if R.status == 0:  # Optimization terminated successfully.
+        sol = R.x
+        for vid, i in V.items():
+            VALL[vid].sv = sol[i]
+        return R.fun
+    
+    elif R.status == 3:  # Problem appears to be unbounded.
+        return -inf
+    
+    elif R.status == 1:  # Iteration limit reached.
+        assert False
+    
+    assert R.status == 2  # Problem appears to be infeasible.
+    return None
 
 
 class variable:
     """
+    name
+    lb, ub: lower and upper bound
+    sv: solution value
+    
     _id: identifier (should not be altered)
     
     NOTE The reason why using ALL and _id is that this class needs to override
@@ -175,7 +219,7 @@ class variable:
         self._id = len(variable._ALL)
         variable._ALL.append(self)
         
-        self.name, self.lb, self.ub = name, 0, inf
+        self.name, self.lb, self.ub, self.sv = name, 0, inf, None
     
     def __repr__(self):
         return f'{self.name}({self.lb},{self.ub})'
@@ -313,13 +357,16 @@ class expression:
     def __rsub__(self, other):
         return (-self).add(other)
     
-    def relate(self, other, reverse, le):
+    def relate(self, other, reverse, is_LE):
+        """
+        NOTE If is_LC is False, it is equality constraint.
+        """
         e = expression(self.ct)
         e.VC = dict(self.VC)
+        e = e.add(other, -1)
         if reverse:
             e = -e
-        e = e.add(other, -1)
-        return assertion(e.VC, le, -e.ct)
+        return assertion(e.VC, is_LE, -e.ct)
     
     def __le__(self, other):
         return self.relate(other, False, True)
@@ -342,6 +389,9 @@ class assertion:
     """
     
     def __init__(self, VC, le, rhs):
+        """
+        Self takes ownership of VC.
+        """
         self.VC, self.le, self.rhs = VC, le, rhs
     
     def __repr__(self):
@@ -387,16 +437,38 @@ def test():
         -x + 4 * y
     )
     
+    c = -3
+    
     m.st([
-        -3 * x + y <= 6,
+        c * x + y <= 6,
         x + 2 * y <= 4
     ])
     
     print(m.to_str())
     
-    R = m.solve()
-    #R = m.solve('scipy')
-    print(R)
+    m = lpm()
+    
+    x = m.var('x').LB(-inf)
+    y = m.var('y').LB(-3)
+    
+    m.min(
+        -x + 4 * y
+    )
+    
+    c = 5
+    
+    m.st([
+        c * x + y <= 6,
+        x + 2 * y <= 4
+    ])
+    
+    print(m.to_str())
+    
+    z0 = m.solve()
+    #z0 = m.solve('scipy')
+    
+    print('z* =', z0)
+    print(f'(x*, y*) = ({x.sv}, {y.sv})')
 
 
 if __name__ == '__main__':
