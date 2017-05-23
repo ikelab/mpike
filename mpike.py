@@ -121,7 +121,7 @@ class lpm:
         else:
             assert False
         
-        return z0 * self.sense
+        return None if z0 is None else (z0 * self.sense + self.obj_fn.ct)
 
 
 def solve_glpk(V, c, A_ub, b_ub, A_eq, b_eq):
@@ -432,34 +432,20 @@ def test():
     
     x = m.var('x').LB(-inf)
     y = m.var('y').LB(-3)
+    z = [m.var(f'z{i}') for i in range(3)]
     
-    m.min(
-        -x + 4 * y
+    m.max(
+        -x + 4 * y + 20 + sum(z[i] for i in range(3)) + 30
     )
     
     c = -3
     
     m.st([
         c * x + y <= 6,
-        x + 2 * y <= 4
-    ])
-    
-    print(m.to_str())
-    
-    m = lpm()
-    
-    x = m.var('x').LB(-inf)
-    y = m.var('y').LB(-3)
-    
-    m.min(
-        -x + 4 * y
-    )
-    
-    c = 5
-    
-    m.st([
-        c * x + y <= 6,
-        x + 2 * y <= 4
+        x + 2 * y <= 4,
+        x + 2 * y >= 2,
+        sum(z[i] for i in range(3)) >= 2,
+        sum(z[i] for i in range(3)) <= 4
     ])
     
     print(m.to_str())
@@ -469,6 +455,7 @@ def test():
     
     print('z* =', z0)
     print(f'(x*, y*) = ({x.sv}, {y.sv})')
+    print(z[0].sv, z[1].sv, z[2].sv)
 
 
 if __name__ == '__main__':
